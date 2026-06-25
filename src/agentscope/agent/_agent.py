@@ -83,6 +83,7 @@ from ..permission import (
     PermissionDecision,
 )
 from ..workspace import Offloader, WorkspaceBase
+from ..checkpoint import Checkpoint, CheckpointerBase
 
 if TYPE_CHECKING:
     from ..middleware import MiddlewareBase
@@ -102,6 +103,7 @@ class Agent:
         middlewares: list[MiddlewareBase] | None = None,
         state: AgentState | None = None,
         offloader: Offloader | None = None,
+        checkpointer: CheckpointerBase | None = None,
         # The agent configurations
         model_config: ModelConfig | None = None,
         context_config: ContextConfig | None = None,
@@ -130,6 +132,11 @@ class Agent:
             offloader (`Offloader | None`, optional):
                 The context offloader. If provided, the compressed context and
                 tool result will be offloaded.
+            checkpointer (`CheckpointerBase | None`, optional):
+                The checkpointer for the backtracking / time-travel
+                capability. When provided, the agent stores a checkpoint of
+                its state after each ReAct iteration. ``None`` (default)
+                disables checkpointing entirely, leaving behaviour unchanged.
             model_config (`ModelConfig`):
                 The additional chat model configuration including fallback
                 model and retries.
@@ -153,6 +160,9 @@ class Agent:
 
         # The offloader/workspace
         self.offloader = offloader
+
+        # The checkpointer for the backtracking / time-travel capability
+        self.checkpointer = checkpointer
 
         # ====================================================================
         # The Tool-related logics
@@ -254,6 +264,37 @@ class Agent:
         """Receive external observation message(s) and save them into
         context."""
         await self._handle_incoming_messages(msgs)
+
+    async def _save_checkpoint(
+        self,
+        source: Literal["iteration", "fork", "manual"] = "iteration",
+    ) -> None:
+        """Persist a checkpoint of the current state, if a checkpointer is
+        configured.
+
+        The new checkpoint's parent is the current head
+        (``state.checkpoint_id``); after a successful store the head is
+        advanced to the new checkpoint. The head is set on the state
+        *before* the store so that the snapshot records its own id. A no-op
+        when no checkpointer is configured.
+
+        Args:
+            source (`Literal["iteration", "fork", "manual"]`, optional):
+                What triggered this checkpoint. Defaults to ``"iteration"``.
+        """
+        if self.checkpointer is None:
+            return
+
+        checkpoint = Checkpoint(
+            thread_id=self.state.session_id,
+            parent_checkpoint_id=self.state.checkpoint_id,
+            step=self.state.cur_iter,
+            source=source,
+            state=self.state,
+        )
+        # Advance the head before storing so the snapshot records its own id.
+        self.state.checkpoint_id = checkpoint.checkpoint_id
+        await self.checkpointer.put(checkpoint)
 
     async def compress_context(
         self,
@@ -667,6 +708,10 @@ class Agent:
 
             # Update the iteration count after each round of reasoning-acting
             self.state.cur_iter += 1
+
+            # Persist a checkpoint for this completed iteration (no-op when
+            # no checkpointer is configured).
+            await self._save_checkpoint()
 
         # ===================================================================
         # Step 4: Handling the max iteration executed
