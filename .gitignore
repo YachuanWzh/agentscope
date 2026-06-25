@@ -159,3 +159,7 @@ pnpm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 lerna-debug.log*
+# superharness ralph runtime state (per-task tracking + retry)
+.claude/superharness/ralph/
+# superharness brainstorm mind-map session state (transient)
+.claude/superharness/brainstorm/
