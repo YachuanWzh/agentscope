@@ -122,3 +122,115 @@ class AgentCheckpointIntegrationTest(IsolatedAsyncioTestCase):
 
         await agent.reply(UserMsg(name="user", content="hi"))
         self.assertIsNone(agent.state.checkpoint_id)
+
+
+class AgentTimeTravelTest(IsolatedAsyncioTestCase):
+    """The get_state / get_state_history / rewind time-travel API."""
+
+    def _make_agent(
+        self,
+        checkpointer: MemoryCheckpointer | None,
+    ) -> tuple[Agent, MockModel]:
+        """Build an agent wired with the echo tool and given checkpointer."""
+        model = MockModel()
+        agent = Agent(
+            name="Friday",
+            system_prompt="You are helpful.",
+            model=model,
+            toolkit=Toolkit(tools=[_EchoTool()]),
+            checkpointer=checkpointer,
+        )
+        return agent, model
+
+    async def test_get_state_and_history(self) -> None:
+        """get_state returns the current head; get_state_history returns the
+        main line newest first."""
+        cpr = MemoryCheckpointer()
+        agent, model = self._make_agent(cpr)
+        _two_tool_rounds_then_text(model)
+        await agent.reply(UserMsg(name="user", content="hi"))
+
+        cur = await agent.get_state()
+        self.assertIsNotNone(cur)
+        self.assertEqual(cur.checkpoint_id, agent.state.checkpoint_id)
+
+        hist = await agent.get_state_history()
+        self.assertEqual(len(hist), 2)
+        self.assertEqual(hist[0].checkpoint_id, agent.state.checkpoint_id)
+
+    async def test_rewind_loads_snapshot(self) -> None:
+        """rewind restores the chosen checkpoint's state and repoints head."""
+        cpr = MemoryCheckpointer()
+        agent, model = self._make_agent(cpr)
+        _two_tool_rounds_then_text(model)
+        await agent.reply(UserMsg(name="user", content="hi"))
+
+        hist = await agent.get_state_history()
+        older = hist[1]  # step 1
+        self.assertEqual(older.step, 1)
+
+        cp = await agent.rewind(older.checkpoint_id)
+        self.assertEqual(cp.checkpoint_id, older.checkpoint_id)
+        self.assertEqual(agent.state.checkpoint_id, older.checkpoint_id)
+        self.assertEqual(agent.state.cur_iter, 1)
+
+        hist2 = await agent.get_state_history()
+        self.assertEqual(
+            [h.checkpoint_id for h in hist2],
+            [older.checkpoint_id],
+        )
+
+    async def test_rewind_then_reply_forks(self) -> None:
+        """Replying after a rewind forks a new branch from the rewound point
+        while the old branch stays retrievable."""
+        cpr = MemoryCheckpointer()
+        agent, model = self._make_agent(cpr)
+        _two_tool_rounds_then_text(model)
+        await agent.reply(UserMsg(name="user", content="hi"))
+        thread = agent.state.session_id
+
+        hist = await agent.get_state_history()
+        head_b, older_a = hist[0], hist[1]
+
+        await agent.rewind(older_a.checkpoint_id)
+
+        # One tool round then text on the new branch.
+        model.set_responses(
+            [
+                [ChatResponse(content=[_tool_call(3)], is_last=True)],
+                [ChatResponse(content=[TextBlock(text="forked")],
+                              is_last=True)],
+            ],
+        )
+        await agent.reply(UserMsg(name="user", content="again"))
+
+        new_head = agent.state.checkpoint_id
+        forked = await cpr.get(thread, new_head)
+        self.assertEqual(forked.parent_checkpoint_id, older_a.checkpoint_id)
+
+        # Old branch tip is still retrievable.
+        self.assertIsNotNone(await cpr.get(thread, head_b.checkpoint_id))
+
+        # Main line now follows the new branch.
+        main_line = await agent.get_state_history()
+        self.assertEqual(
+            [h.checkpoint_id for h in main_line],
+            [new_head, older_a.checkpoint_id],
+        )
+
+    async def test_time_travel_without_checkpointer(self) -> None:
+        """The API degrades gracefully without a checkpointer."""
+        agent, _ = self._make_agent(None)
+        self.assertIsNone(await agent.get_state())
+        self.assertEqual(await agent.get_state_history(), [])
+        with self.assertRaises(RuntimeError):
+            await agent.rewind("x")
+
+    async def test_rewind_unknown_checkpoint_raises(self) -> None:
+        """Rewinding to a non-existent checkpoint raises ValueError."""
+        cpr = MemoryCheckpointer()
+        agent, model = self._make_agent(cpr)
+        _two_tool_rounds_then_text(model)
+        await agent.reply(UserMsg(name="user", content="hi"))
+        with self.assertRaises(ValueError):
+            await agent.rewind("does-not-exist")

@@ -296,6 +296,83 @@ class Agent:
         self.state.checkpoint_id = checkpoint.checkpoint_id
         await self.checkpointer.put(checkpoint)
 
+    async def get_state(self) -> Checkpoint | None:
+        """Return the checkpoint the agent currently sits at.
+
+        Returns:
+            `Checkpoint | None`: The current checkpoint (the head, or the
+            checkpoint last rewound to), or ``None`` when no checkpointer is
+            configured or nothing has been checkpointed yet.
+        """
+        if self.checkpointer is None:
+            return None
+        if self.state.checkpoint_id is not None:
+            return await self.checkpointer.get(
+                self.state.session_id,
+                self.state.checkpoint_id,
+            )
+        return await self.checkpointer.get_latest(self.state.session_id)
+
+    async def get_state_history(self) -> list[Checkpoint]:
+        """Return the linear backtracking history (newest first).
+
+        Walks parents from the current position to the root. After a fork
+        this follows the current branch, mirroring LangGraph's
+        ``get_state_history``.
+
+        Returns:
+            `list[Checkpoint]`: Checkpoints from the current position back
+            to the root, newest first; empty when no checkpointer is set.
+        """
+        if self.checkpointer is None:
+            return []
+        return await self.checkpointer.list(
+            self.state.session_id,
+            from_checkpoint_id=self.state.checkpoint_id,
+        )
+
+    async def rewind(self, checkpoint_id: str) -> Checkpoint:
+        """Restore the agent to an earlier checkpoint (time travel).
+
+        Loads the checkpoint's state snapshot back into the agent and moves
+        the head to it. Replying afterwards forks a new branch off this
+        point; the previously-current branch is preserved and remains
+        retrievable via the checkpointer.
+
+        Args:
+            checkpoint_id (`str`):
+                The id of the checkpoint to restore.
+
+        Returns:
+            `Checkpoint`: The restored checkpoint.
+
+        Raises:
+            RuntimeError: If no checkpointer is configured.
+            ValueError: If the checkpoint id is not found in this thread.
+        """
+        if self.checkpointer is None:
+            raise RuntimeError(
+                "No checkpointer configured; cannot rewind.",
+            )
+        checkpoint = await self.checkpointer.get(
+            self.state.session_id,
+            checkpoint_id,
+        )
+        if checkpoint is None:
+            raise ValueError(
+                f"Checkpoint {checkpoint_id!r} not found for session "
+                f"{self.state.session_id!r}.",
+            )
+
+        # The checkpointer returns an isolated deep copy, so adopting its
+        # state directly is safe. Pin the head to the restored checkpoint.
+        self.state = checkpoint.state
+        self.state.checkpoint_id = checkpoint.checkpoint_id
+
+        # Keep the permission engine consistent with the restored context.
+        self._engine = PermissionEngine(self.state.permission_context)
+        return checkpoint
+
     async def compress_context(
         self,
         context_config: ContextConfig | None = None,
