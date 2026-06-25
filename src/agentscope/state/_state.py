@@ -156,6 +156,11 @@ class AgentState(BaseModel):
     cur_iter: int = 0
     """The current iteration of the agent's reasoning-acting loop."""
 
+    checkpoint_id: str | None = None
+    """The id of the checkpoint this state currently sits at (the head of
+    the backtracking history). ``None`` when checkpointing is not in use.
+    Optional and additive: omitting it on load preserves legacy behaviour."""
+
     # =================================================================
     # The permission context
     # =================================================================
